@@ -1,0 +1,879 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<title>Test animacji postaci</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #1c2026; color: #e8eaed;
+    font: 14px/1.4 system-ui, "Segoe UI", sans-serif; }
+  canvas { display: block; }
+  #hud { position: fixed; left: 14px; top: 12px; pointer-events: none; text-shadow: 0 1px 2px #000; }
+  #hud b { color: #ffd166; }
+  #state { margin-top: 6px; opacity: .85; font-variant-numeric: tabular-nums; }
+  #bar { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; width: min(96vw, 1100px); }
+  #cross { position: fixed; left: 50%; top: 50%; width: 6px; height: 6px; margin: -3px; border-radius: 50%; background: #fffc; box-shadow: 0 0 0 1px #0008; display: none; pointer-events: none; }
+  button { background: #2c323b; color: #e8eaed; border: 1px solid #454d59; border-radius: 8px; padding: 9px 14px;
+    font: inherit; cursor: pointer; }
+  button:hover { background: #38404b; }
+  button.on { background: #ffd166; color: #1c2026; border-color: #ffd166; font-weight: 600; }
+  kbd { background: #0006; border: 1px solid #fff3; border-radius: 4px; padding: 0 5px; font: inherit; }
+  #credit { position: fixed; right: 10px; bottom: 6px; font-size: 11px; opacity: .45; }
+  #err { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; padding: 30px; text-align: center; color: #ff8a80; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.min.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="hud">
+  <div><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> ruch &nbsp; <kbd>Mysz</kbd> rozglądanie &nbsp; <kbd>LPM</kbd> strzał &nbsp; <kbd>PPM</kbd> celowanie &nbsp; <kbd>Shift</kbd> sprint &nbsp; <kbd>Ctrl</kbd>/<kbd>C</kbd> kucanie &nbsp; <kbd>Spacja</kbd> skok</div>
+  <div><kbd>V</kbd> kamera: FPP / zza pleców / od przodu &nbsp; <kbd>F</kbd> schowaj/wyjmij broń &nbsp; <kbd>X</kbd> chód &nbsp; kółko = zoom &nbsp; <kbd>1</kbd>–<kbd>6</kbd> broń &nbsp; <kbd>K</kbd>/<kbd>L</kbd> strój &nbsp; <kbd>J</kbd> głowa &nbsp; <kbd>R</kbd> następny spawn &nbsp; — kliknij w obraz, żeby złapać mysz (<kbd>Esc</kbd> zwalnia)</div>
+  <div id="state"></div>
+</div>
+<div id="cross"></div>
+<div id="bar">
+  <button id="bCam">Kamera (V)</button>
+  <button id="bAuto">Auto-bieg</button>
+  <button id="bWalk">Chód (X)</button>
+  <button id="bRun">Sprint (Shift)</button>
+  <button id="bCrouch">Kucnij (C)</button>
+  <button id="bJump">Skok (Spacja)</button>
+  <button id="bWeapon">Broń (F)</button>
+  <button id="bAim">Celuj (PPM)</button>
+  <button id="bFire">Ogień (LPM)</button>
+  <button id="bSlow">Slow-motion</button>
+  <button id="bSkel">Szkielet</button>
+  <button id="bFull">Pełny ekran</button>
+  <button id="bOutfit">Strój (K)</button>
+  <button id="bHead">Głowa (J)</button>
+  <button id="bCreator">Kreator głów</button>
+</div>
+<div id="credit">Model: „Dress To Impress Man Base (With Bones)” — zHairezt, Sketchfab, CC-BY-4.0</div>
+<div id="err"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { createMap, applyMapLighting, LIGHT } from './map/map.js';
+import { createWorld } from './game/physics.js';
+import { loadWeapons, WEAPON_ORDER } from './game/weapons.js';
+import { initOutfits, OUTFITS } from './game/outfits.js';
+import { createHeadGeometry, makeHeadMaterial, blankHeadTexture, prepHeadTexture } from './game/head.js';
+const BUILD = 'v6-0';
+
+// ---------- helpers ----------
+const V = (x = 0, y = 0, z = 0) => new THREE.Vector3(x, y, z);
+const Q = () => new THREE.Quaternion();
+const qE = (x, y, z) => Q().setFromEuler(new THREE.Euler(x, y, z, 'YXZ'));   // = Ry * Rx * Rz
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const clamp01 = (x) => clamp(x, 0, 1);
+const sstep = (a, b, x) => { const t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+const lerp = (a, b, t) => a + (b - a) * t;
+const damp = (x, target, rate, dt) => x + (target - x) * (1 - Math.exp(-rate * dt));
+const approach = (x, target, rate, dt) => x + Math.sign(target - x) * Math.min(Math.abs(target - x), rate * dt);
+const wrap = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+const TAU = Math.PI * 2;
+
+// ---------- scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+const PR_MAX = Math.min(devicePixelRatio, 2);
+renderer.setPixelRatio(PR_MAX);
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+document.body.appendChild(renderer.domElement);
+const canvas = renderer.domElement;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1c2026);
+const camera = new THREE.PerspectiveCamera(72, innerWidth / innerHeight, 0.05, 1000);   // the map's water backdrop reaches 900 m
+
+// the map's vertex colours are baked for exactly this sun + hemisphere pair, so the game uses the map's lights and nothing else.
+// The map itself neither casts nor receives realtime shadows: the sun only renders the character into a tight shadow box,
+// and one small transparent quad under the feet receives it.
+const { sun } = applyMapLighting(scene);
+const SUN_DIR = V(...LIGHT.sunDir);
+sun.castShadow = true;
+sun.shadow.mapSize.set(1024, 1024);                 // a tight box around the character keeps the same texel density as 2048² over 8 m
+Object.assign(sun.shadow.camera, { left: -2.4, right: 2.4, top: 2.4, bottom: -2.4, near: 1, far: 18 });
+sun.shadow.bias = -0.0005; sun.shadow.normalBias = 0.01;
+const shadowQuad = new THREE.Mesh(new THREE.PlaneGeometry(6, 6), new THREE.ShadowMaterial({ opacity: 0.42, depthWrite: false }));
+shadowQuad.rotation.x = -Math.PI / 2; shadowQuad.receiveShadow = true; shadowQuad.renderOrder = 1; scene.add(shadowQuad);
+
+// ---------- map ----------
+let world = null;                                   // collision queries (game/physics.js), set once the map is in
+let spawnI = -1;
+function spawn(i) {
+  const sp = world.spawns; spawnI = i === undefined ? Math.floor(Math.random() * sp.length) : ((i % sp.length) + sp.length) % sp.length;
+  const s = sp[spawnI];
+  actor.position.set(s.p[0], 0, s.p[2]); S.py = S.base = S.ground = world.groundAt(s.p[0], s.p[2], s.p[1]); actor.position.y = S.py;
+  actor.rotation.y = S.lookYaw = S.pYaw = s.yaw; S.lookPitch = S.pPitch = 0; S.yawOff = 0;
+  S.vx = S.vz = 0; S.pvy = 0; S.jState = 'none'; S.auto = false;
+}
+createMap({ renderer }).then((map) => {
+  scene.add(map.group); world = createWorld(map.collision); spawn();
+  window.dbg.map = map; window.dbg.world = world;
+}).catch((e) => fail('Nie udało się wczytać mapy: ' + (e.message || e)));
+
+// ---------- state ----------
+const CAMS = ['fpp', 'tpp', 'front'], CAM_LABEL = { fpp: 'FPP', tpp: 'zza pleców', front: 'od przodu' };
+const S = {
+  time: 0, phase: 0, paused: false, slow: false, cam: 'tpp', camDist: 3.2, fov: 58,
+  auto: false, walkLock: false, runLock: false, crouchLock: false, aimLock: false, fireLock: false, fireHeld: false, aimHeld: false,
+  lookYaw: 0, lookPitch: 0, yawOff: 0, turnAmt: 0, turnRate: 0, pYaw: 0, pPitch: 0, swY: 0, swP: 0,
+  vx: 0, vz: 0, dirX: 0, dirZ: 1, leanX: 0, leanZ: 0, legYaw: 0,       // velocity in the look frame (x = left, z = forward)
+  crouch: 0, crouchT: 0, weapon: 1, weaponT: 1, aim: 0, sprintK: 0,
+  jState: 'none', jT: 0, py: 0, pvy: 0, jReq: false,          // jump state machine (py = feet height in the world)
+  ground: 0, base: 0,                                          // ground height under the feet; smoothed height the camera rides on
+  jAir: 0, jSquat: 0, jArm: 0, jTuck: 0, jRise: 0, jFall: 0,
+  rec: 0, recYaw: 0, climb: 0, fireCd: 0, fireHold: 0, trigger: 0, flash: 0, shots: 0,
+  fireFresh: false, shotT: 9, swapTo: null,                    // semi-auto needs a new press; time since the last shot; weapon being drawn
+};
+const keys = new Set();
+const WALK = 1.6, JOG = 3.2, SPRINT = 5.8, CROUCH = 1.4, JUMP_V = 4.6, GRAV = 16;
+
+// ---------- actor ----------
+const actor = new THREE.Group(); scene.add(actor);
+const HEIGHT = 1.8, MODEL_UNITS = 6.63, SC = HEIGHT / MODEL_UNITS;
+const modelRoot = new THREE.Group(); modelRoot.scale.setScalar(SC); actor.add(modelRoot);
+
+const rest = new Map();     // bone -> rest data (actor space)
+const B = {};               // named bones
+let skelHelper = null, skelOn = false, headMesh = null, blockHead = null, bodyMesh = null, gltfScene = null;
+
+// the held weapon. Local frame: +Z muzzle, +Y up, origin on the bore above the pistol grip. The models come from
+// game/weapons.js (one merged mesh each, plus the slide / pump where it moves); this group only carries the matrix.
+const weapon = new THREE.Group(); weapon.matrixAutoUpdate = false; scene.add(weapon);
+const flash = new THREE.Group();
+{
+  // muzzle flash: crossed additive quads + a short forward cone, plus a light
+  const fm = new THREE.MeshBasicMaterial({ color: 0xffc766, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: false });
+  for (let i = 0; i < 3; i++) { const p = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.16), fm); p.rotation.z = i * Math.PI / 3; flash.add(p); }
+  const cone = new THREE.Mesh(new THREE.ConeGeometry(0.035, 0.22, 8, 1, true), fm); cone.rotation.x = -Math.PI / 2; cone.position.z = 0.10; flash.add(cone);
+  const fl = new THREE.PointLight(0xffb040, 5, 6, 2); flash.add(fl);
+  flash.position.set(0, 0.004, 0.47); flash.visible = false; weapon.add(flash);
+}
+// attachment points of the weapon in hand (weapon frame, metres) - overwritten by setWeapon() from the weapon's definition
+const W_BUTT = V(0, -0.02, -0.245), W_GRIP_R = V(0, -0.078, -0.03), W_GRIP_L = V(0, -0.032, 0.215);
+const W_MUZZLE = V(0, 0.004, 0.46), W_PORT = V(-0.028, 0.02, 0.03), W_SIGHT_EYE = V(0, 0.082, -0.20);
+let arsenal = null, WPN = null;                       // all loaded weapons; the one in hand
+function setWeapon(id) {
+  if (WPN) weapon.remove(WPN.group);
+  WPN = arsenal[id]; weapon.add(WPN.group);
+  const d = WPN.def;
+  W_BUTT.set(...d.butt); W_GRIP_R.set(...d.gripR); W_GRIP_L.set(...d.gripL); W_MUZZLE.set(...d.muzzle); W_PORT.set(...d.port); W_SIGHT_EYE.set(...d.eye);
+  flash.position.copy(W_MUZZLE).z += 0.02;
+  GRIP_Q_L = d.lhand === 'side' ? GRIP_Q_L_SIDE : GRIP_Q_L_UNDER;
+  S.fireCd = Math.max(S.fireCd, 0.15);
+}
+loadWeapons(THREE, GLTFLoader).then((a) => { arsenal = a; setWeapon('ak47'); window.dbg.arsenal = a; })
+  .catch((e) => fail('Nie udało się wczytać broni: ' + (e.message || e)));
+// hand bone axes: +Y to the fingers, -Z out of the palm, thumb on +X (left hand) / -X (right hand)
+const basisQ = (yv, palmNormal) => {
+  const y = yv.clone().normalize();
+  const z = palmNormal.clone().multiplyScalar(-1); z.addScaledVector(y, -z.dot(y)).normalize();
+  const x = y.clone().cross(z);
+  return Q().setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z));
+};
+// grip orientations expressed in the weapon frame (+X of the weapon = shooter's left)
+const GRIP_Q_R = basisQ(V(0, 0.42, 0.9), V(1, 0, 0));          // palm pressed on the right side of the grip
+const GRIP_Q_L_UNDER = basisQ(V(-0.55, 0.40, 0.72), V(-0.45, 0.88, -0.1)); // palm cupping the handguard from below
+const GRIP_Q_L_SIDE = basisQ(V(-0.25, 0.50, 0.83), V(-0.95, 0.25, 0.1));   // support hand wrapped round a pistol grip from the left
+let GRIP_Q_L = GRIP_Q_L_UNDER;
+const PALM_R = V(0, 0.075, -0.028), PALM_L = V(0, 0.08, -0.034);    // wrist -> palm centre, hand space (m)
+
+// spent cases + tracers (tiny pooled props so the shots read clearly)
+const shells = [], tracers = [];
+{
+  const brass = new THREE.MeshStandardMaterial({ color: 0xc9a24a, roughness: 0.35, metalness: 0.9 });
+  const sg = new THREE.BoxGeometry(0.008, 0.008, 0.022);
+  for (let i = 0; i < 30; i++) { const m = new THREE.Mesh(sg, brass); m.visible = false; scene.add(m); shells.push({ m, v: V(), w: V(), life: 0 }); }
+  const tm = new THREE.MeshBasicMaterial({ color: 0xffe2a0, transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending, depthWrite: false, fog: false });
+  const tg = new THREE.BoxGeometry(0.012, 0.012, 1.6);
+  for (let i = 0; i < 10; i++) { const m = new THREE.Mesh(tg, tm); m.visible = false; scene.add(m); tracers.push({ m, v: V(), life: 0 }); }
+}
+let shellI = 0, tracerI = 0;
+
+// ---------- loading ----------
+let ready = false;
+const R = {};   // rig constants (actor space, metres)
+new GLTFLoader().load('./character.glb', (gltf) => {
+  // the rig constants below are measured in world space, so the actor must sit at the origin while they are taken
+  // (the map may have loaded first and already put it on a spawn point)
+  const keepP = actor.position.clone(), keepR = actor.rotation.y; actor.position.set(0, 0, 0); actor.rotation.y = 0;
+  modelRoot.add(gltf.scene);
+  gltf.scene.traverse((o) => {
+    if (!o.isMesh) return;
+    o.castShadow = true;
+    o.geometry.computeBoundingBox();
+    // the model's materials have zero specular: a Lambert (pure diffuse) shader renders the same look far cheaper than the
+    // physical shader the loader creates, and single-sided is enough for the closed body mesh
+    const pm = o.material, isBody = o.geometry.attributes.position.count > 3000;
+    o.material = new THREE.MeshLambertMaterial({ color: pm.color, map: pm.map, normalMap: pm.normalMap, side: isBody ? THREE.FrontSide : THREE.DoubleSide });
+    if (pm.normalScale) o.material.normalScale.copy(pm.normalScale);
+    o.userData.oldMaterial = pm;
+    if (!bodyMesh || o.geometry.attributes.position.count > bodyMesh.geometry.attributes.position.count) bodyMesh = o;
+    if (o.geometry.boundingBox.min.y > 5) blockHead = o;      // the model's separate block head, replaced below
+  });
+  const byName = {};
+  gltf.scene.traverse((o) => { if (o.isBone) byName[o.name] = o; });
+  const find = (n) => { const k = n.replace(/[.\s]/g, ''); const b = byName[k] || byName[n];
+    if (!b) throw new Error('Brak kości: ' + n); return b; };
+  Object.assign(B, {
+    hips: find('Hips_02'), sp1: find('Spine_011'), sp2: find('Spine.2_012'), sp3: find('Spine.3_013'),
+    neck: find('Neck_014'), head: find('Head_015'),
+    legL: find('Leg.001.L_03'), shinL: find('Leg.002.L_04'), footL: find('Foot.003.L_05'),
+    legR: find('Leg.001.R_07'), shinR: find('Leg.002.R_08'), footR: find('Foot.003.R_09'),
+    shL: find('Shoulder.L_017'), armL: find('Arm.L_018'), foreL: find('Arm01.L_019'), handL: find('Hand.L_020'),
+    shR: find('Shoulder.R_041'), armR: find('Arm.R_042'), foreR: find('Arm01.R_043'), handR: find('Hand.R_044'),
+  });
+  const findPrefix = (p) => { const k = p.replace(/\./g, ''); const n = Object.keys(byName).filter((x) => x.startsWith(k + '_') && !x.includes('end'));
+    if (!n.length) throw new Error('Brak kości: ' + p); return byName[n[0]]; };
+  B.fingers = {};
+  for (const side of ['L', 'R']) {
+    B.fingers[side] = [['001', '002', '003'], ['011', '012', '013'], ['021', '022', '023'], ['031', '032', '033']]
+      .map((f) => f.map((n) => findPrefix(`Finger.${n}.${side}`)));
+  }
+  actor.updateMatrixWorld(true);
+  // one generous fixed bounding sphere (1.75 m around the waist, converted into each mesh's own space) so the skinned
+  // meshes can be frustum-culled when off screen without recomputing bounds every frame
+  gltf.scene.traverse((o) => {
+    if (!o.isSkinnedMesh) return;
+    o.frustumCulled = true;
+    o.boundingSphere = new THREE.Sphere(o.worldToLocal(V(0, 0.9, 0)), 1.75 / o.matrixWorld.getMaxScaleOnAxis());
+  });
+  gltf.scene.traverse((o) => {
+    if (!o.isBone) return;
+    rest.set(o, { p: o.position.clone(), q: o.quaternion.clone(), wq: o.getWorldQuaternion(Q()),
+      wp: o.getWorldPosition(V()), pwq: o.parent.getWorldQuaternion(Q()) });
+  });
+  gltfScene = gltf.scene; buildHead(); prepSkin(); applyOutfit(0);
+  rest.get(B.head).p.multiplyScalar(0.58);                // shorter neck: the head sits ~4 cm lower
+  skelHelper = new THREE.SkeletonHelper(gltf.scene);       // only added to the scene while switched on (it costs time every frame)
+  const r = (b) => rest.get(b);
+  R.hips = r(B.hips).wp.clone();
+  R.hipL = r(B.legL).wp.clone().sub(R.hips); R.hipR = r(B.legR).wp.clone().sub(R.hips);
+  R.ankle = r(B.footL).wp.clone();                      // x>0 (left), y = ankle height, z
+  R.legLen = r(B.legL).wp.distanceTo(r(B.shinL).wp) + r(B.shinL).wp.distanceTo(r(B.footL).wp);
+  R.armLen = r(B.armL).wp.distanceTo(r(B.foreL).wp) + r(B.foreL).wp.distanceTo(r(B.handL).wp);
+  R.chestRestInv = new THREE.Matrix4().compose(r(B.sp3).wp, r(B.sp3).wq, V(1, 1, 1)).invert();
+  R.heelZ = -0.075; R.ballZ = 0.12;                     // sole pivots relative to the ankle
+  actor.position.copy(keepP); actor.rotation.y = keepR;
+  setCam(S.cam);
+  ready = true;
+}, undefined, (e) => fail('Nie udało się wczytać modelu: ' + (e.message || e)));
+
+// The head is a blank canvas (game/head.js): a smooth skull with no face, painted in the head creator (kreator-glowy.html).
+// The painted texture lies over the outfit's skin colour. Parented rigidly to the head bone; hidden in first person.
+let headMat = null;
+function buildHead() {
+  if (blockHead) {                                          // drop the block head and free its geometry and textures
+    blockHead.parent.remove(blockHead); blockHead.geometry.dispose();
+    for (const m of [blockHead.material, blockHead.userData.oldMaterial]) { if (!m) continue;
+      for (const k of ['map', 'specularIntensityMap', 'specularColorMap', 'normalMap']) if (m[k]) m[k].dispose(); m.dispose(); }
+  }
+  gltfScene.traverse((o) => { if (o.isMesh && o.userData.oldMaterial) { o.userData.oldMaterial.dispose(); delete o.userData.oldMaterial; } });
+  headMat = makeHeadMaterial(THREE);
+  const holder = new THREE.Group(); holder.matrixAutoUpdate = false;
+  holder.matrix.copy(B.head.matrixWorld).invert(); B.head.add(holder);
+  const m = new THREE.Mesh(createHeadGeometry(THREE), headMat);
+  m.position.set(0, 1.674, -0.008); m.castShadow = true; holder.add(m);
+  headSkin = m; headMesh = holder;
+}
+
+// ---------- outfits ----------
+// Clothes are separate geometry laid over the body (game/outfits.js): every garment is cut out of the body mesh along its
+// edge, pushed off the skin by the fabric's thickness, given a straight leg / sleeve, a visible hem, and the skin under it
+// is dropped. Seams, buttons, pockets, prints and folds are shaded per pixel. One extra draw call per character.
+let headSkin = null, bodySkin = null, bottomMesh = null, skinI = 0;
+function prepSkin() {
+  bodySkin = initOutfits(THREE, { bodyMesh, actor, B, rest, headMat });
+  // the model's separate briefs mesh would poke through the trousers - hidden (one draw call less)
+  gltfScene.traverse((o) => { if (o.isMesh && o !== bodyMesh && o.name !== 'clothes') bottomMesh = o; });
+  if (bottomMesh) bottomMesh.visible = false;
+}
+function applyOutfit(i) {
+  skinI = ((i % OUTFITS.length) + OUTFITS.length) % OUTFITS.length;
+  const st = bodySkin.apply(OUTFITS[skinI]);
+  applyHead();
+  return st;
+}
+const nextSkin = () => { if (bodySkin) applyOutfit(skinI + 1); };
+const prevSkin = () => { if (bodySkin) applyOutfit(skinI - 1); };
+
+// ---------- head skins (painted in kreator-glowy.html, saved by server.ps1 into skins/heads/) ----------
+// A head assigned to an outfit in the creator appears automatically with that outfit; J cycles through all of them.
+const HEADS = { list: [], tex: new Map(), pick: -1 };        // pick: -1 = the outfit's own head, otherwise an index into list
+const blankHead = blankHeadTexture(THREE);
+async function loadHeads() {
+  try {
+    const r = await fetch('skins/heads/index.json', { cache: 'no-store' });
+    const j = r.ok ? await r.json() : [];
+    HEADS.list = (Array.isArray(j) ? j : [j]).filter((h) => h && h.name && h.file);
+  } catch (e) { HEADS.list = []; }
+  if (HEADS.pick >= HEADS.list.length) HEADS.pick = -1;
+  for (const h of HEADS.list) headTex(h);                      // wczytaj od razu, zeby zmiana stroju nie mrugala pusta glowa
+  applyHead();
+}
+function headTex(h) {
+  const key = h.name + '@' + h.t;
+  if (!HEADS.tex.has(key)) {
+    for (const [k, t] of HEADS.tex) if (k.startsWith(h.name + '@')) { t.dispose(); HEADS.tex.delete(k); }   // older version
+    const t = new THREE.TextureLoader().load('skins/heads/' + h.file + '?t=' + h.t);
+    HEADS.tex.set(key, prepHeadTexture(THREE, t, renderer));
+  }
+  return HEADS.tex.get(key);
+}
+function currentHead() {
+  if (HEADS.pick >= 0) return HEADS.list[HEADS.pick] || null;
+  const id = OUTFITS[skinI] && OUTFITS[skinI].id;
+  const own = HEADS.list.filter((h) => h.outfit === id).sort((a, b) => b.t - a.t);
+  return own[0] || null;
+}
+function applyHead() {
+  if (!headMat) return;
+  const h = currentHead();
+  headMat.map = h ? headTex(h) : blankHead;
+}
+function nextHead() { HEADS.pick = HEADS.pick + 1 >= HEADS.list.length ? -1 : HEADS.pick + 1; applyHead(); }
+addEventListener('focus', loadHeads);                         // back from the creator -> fresh list
+loadHeads();
+function fail(msg) { const el = document.getElementById('err'); el.style.display = 'flex'; el.textContent = msg; console.error(msg); }
+addEventListener('error', (e) => fail('Błąd: ' + e.message));
+
+// ---------- rig primitives ----------
+// FK: rotate a bone by D, expressed in actor axes (X = left, Y = up, Z = forward) of the rest pose
+function fk(bone, D) {
+  const r = rest.get(bone);
+  bone.quaternion.copy(r.pwq).invert().multiply(D).multiply(r.pwq).multiply(r.q);
+}
+function setWorldQuat(bone, qw) {
+  const pq = bone.parent.getWorldQuaternion(Q()).invert();
+  bone.quaternion.copy(pq.multiply(qw));
+}
+const setActorQuat = (bone, qa) => setWorldQuat(bone, actor.quaternion.clone().multiply(qa));
+function aimBone(bone, from, to) {
+  const qd = Q().setFromUnitVectors(from, to);
+  setWorldQuat(bone, bone.getWorldQuaternion(Q()).premultiply(qd));
+}
+// analytic two-bone IK in world space with a pole (bend direction) vector
+function ik(A, Bn, C, target, pole) {
+  const a = A.getWorldPosition(V()), b = Bn.getWorldPosition(V()), c = C.getWorldPosition(V());
+  const lab = a.distanceTo(b), lbc = b.distanceTo(c);
+  const dir = target.clone().sub(a); let d = dir.length(); dir.normalize();
+  d = Math.min(Math.max(d, Math.abs(lab - lbc) + 1e-4), (lab + lbc) * 0.9995);
+  const x = (lab * lab - lbc * lbc + d * d) / (2 * d), h = Math.sqrt(Math.max(0, lab * lab - x * x));
+  const pp = pole.clone().addScaledVector(dir, -pole.dot(dir)); if (pp.lengthSq() < 1e-8) pp.set(0, 0, 1); pp.normalize();
+  const mid = a.clone().addScaledVector(dir, x).addScaledVector(pp, h);
+  aimBone(A, b.sub(a).normalize(), mid.sub(a).normalize());
+  Bn.getWorldPosition(b); C.getWorldPosition(c);
+  const tgt = a.clone().addScaledVector(dir, d);
+  aimBone(Bn, c.sub(b).normalize(), tgt.sub(b).normalize());
+}
+const toWorld = (v) => actor.localToWorld(v.clone());
+const dirToWorld = (v) => v.clone().applyQuaternion(actor.quaternion);
+
+// ---------- gait ----------
+// cadence / stride for a given speed. r: walk → jog (flight phase appears), q: jog → sprint
+function gaitParams(sp, c, dz) {
+  const r = sstep(1.8, 3.0, sp) * (1 - c), q = sstep(3.8, 5.6, sp) * (1 - c);
+  const Tb = lerp(lerp(lerp(0.95, 0.85, c), 0.64, r), 0.49, q), st = lerp(lerp(0.6, 0.38, r), 0.30, q);
+  const Lf = lerp(lerp(0.78, 0.6, c), 1.3, r);                                       // longest natural stance travel going forward
+  const Lmax = dz >= 0 ? lerp(0.5, Lf, dz * dz) : lerp(0.5, 0.70, dz * dz);          // sideways / backward steps are short and quick
+  const T = sp > 0.01 ? clamp(Lmax / (st * sp), 0.40, Tb) : Tb;
+  return { r, q, T, st, L: st * sp * T };
+}
+// One foot over its cycle p∈[0,1): stance (heel strike → flat → toe-off) then swing. s = position along the stride.
+function gaitFoot(p, st, r, q) {
+  const a0 = lerp(lerp(0.5, 0.38, r), 0.32, q), hs = lerp(lerp(-0.30, -0.08, r), 0.06, q), to = lerp(lerp(0.65, 0.95, r), 1.1, q);
+  let s, pitch = 0, lift = 0;
+  if (p < st) {
+    const u = p / st; s = a0 - u;
+    if (u < 0.15) pitch = hs * (1 - u / 0.15); else if (u > 0.5) pitch = to * Math.pow((u - 0.5) / 0.5, 1.6);
+  } else {
+    const u = (p - st) / (1 - st), e = u * u * (3 - 2 * u), k = lerp(0.45, 0.7, r); s = (a0 - 1) + e;
+    lift = Math.sin(Math.PI * Math.pow(u, lerp(lerp(0.85, 0.62, r), 0.55, q)));   // running: the heel kicks up early
+    pitch = u < k ? to * (1 - sstep(lerp(0, 0.25, r), k, u)) : hs * sstep(k, 1, u);
+  }
+  return { s, pitch, lift };
+}
+// ankle position for a foot whose flat position is (x, zf), pitched about the heel (toes up) or the ball (heel up)
+function anklePos(x, zf, pitch, lift) {
+  const pz = pitch >= 0 ? R.ballZ : R.heelZ, h = R.ankle.y;
+  return V(x, h * Math.cos(pitch) + pz * Math.sin(pitch) + lift, zf + pz + h * Math.sin(pitch) - pz * Math.cos(pitch));
+}
+
+// ---------- the pose ----------
+let wM = new THREE.Matrix4();          // weapon world matrix of the current frame
+function pose() {
+  for (const [b, r] of rest) { b.position.copy(r.p); b.quaternion.copy(r.q); }
+  actor.updateMatrixWorld(true);
+
+  const c = sstep(0, 1, S.crouch), w = S.weapon, a = sstep(0, 1, S.aim) * sstep(0.85, 1, w);
+  const sp = Math.hypot(S.vx, S.vz);
+  if (sp > 0.05) { S.dirX = S.vx / sp; S.dirZ = S.vz / sp; }
+  // running diagonally the hips and legs turn towards the direction of travel (the chest twists back to keep facing the target),
+  // so the legs mostly run forward instead of side-shuffling; dx/dz below are the travel direction as the legs see it
+  const lyaw = S.legYaw, udx = S.dirX, udz = S.dirZ, th = Math.atan2(udx, udz) - lyaw, YAX = V(0, 1, 0);
+  const dx = Math.sin(th), dz = Math.cos(th), G = gaitParams(sp, c, dz), r = G.r, q = G.q;
+  const air = S.jAir, m = clamp01(sp / 1.2), mg = m * (1 - air);          // gait amplitude (fades out in the air)
+  const ph = S.phase, t = S.time, rec = S.rec, lookP = S.lookPitch, yawOff = S.yawOff, turn = S.turnAmt;
+  const breath = Math.sin(t * 1.7), breath2 = Math.sin(t * 1.7 - 0.9);
+  const wHold = sstep(0.3, 0.9, w), spr = S.sprintK * wHold;   // rifle stance amount, rifle lowered for the sprint
+  const fp = S.cam === 'fpp' ? 1 : 0;
+  const cyc = Math.cos(TAU * ph), syc = Math.sin(TAU * (ph - 0.05));
+
+  // --- feet (actor space) ---
+  // step width: a relaxed stance when standing, but walking feet land ~5 cm either side of the line of travel and running
+  // feet almost on it (people do not walk with their feet as far apart as they stand)
+  const stX = lerp(lerp(R.ankle.x, R.ankle.x + 0.045, c) + 0.02 * wHold, lerp(0.05, 0.028, r) + 0.045 * c, m) + 0.02 * Math.abs(dx) * m;
+  const kneeOut = lerp(0.12 + 0.06 * wHold, 0.02, m) + 0.45 * c;       // knees track straight ahead once moving
+  const stagger = (1 - m) * (0.07 * c + 0.07 * wHold) + 0.085 * Math.abs(dx) * m;   // strafing: feet pass each other front/back
+  const liftH = lerp(lerp(lerp(0.08, 0.05, c), 0.20, r), 0.30, q) * clamp01(sp / 0.7) + 0.04 * turn;
+  const feet = [1, -1].map((side) => {
+    const g = gaitFoot((ph + (side > 0 ? 0 : 0.5)) % 1, G.st, r, q);
+    let pitch = g.pitch * dz * m * (1 - 0.35 * c); if (dz < 0) pitch = clamp(pitch, -0.3, 0.35);
+    const pos = anklePos(side * stX + dx * G.L * g.s, R.ankle.z + side * stagger + dz * G.L * g.s, pitch, g.lift * liftH);
+    pos.applyAxisAngle(YAX, lyaw);
+    return { side, pos, pitch, yaw: side * (lerp(0.06, 0.025, m) + 0.16 * c + 0.05 * wHold * (1 - m)) + lyaw };
+  });
+
+  // --- pelvis ---
+  const bobOff = lerp(0.05, 0.18, r);
+  const hp = V(
+    0.022 * syc * mg * (1 - 0.5 * r) + 0.006 * Math.sin(t * 0.55) * (1 - m),
+    R.hips.y - (lerp(0.035, 0.06, r) + 0.02 * q) * mg * (1 - c) - 0.33 * c - lerp(lerp(0.022, 0.045, r), 0.05, q) * Math.cos(2 * TAU * (ph - bobOff)) * mg
+      + 0.004 * breath * (1 - m) - S.jSquat - (0.02 * wHold + 0.035 * a) * (1 - c) * (1 - m),
+    R.hips.z - 0.10 * c + 0.015 * m * udz - 0.25 * S.jSquat - 0.004 * rec - 0.02 * a);
+  const pelvisPitch = (0.03 * m + 0.06 * r + 0.08 * q) * udz + 0.20 * c + 0.9 * S.jSquat + 0.5 * S.leanZ + 0.03 * wHold + 0.06 * a;
+  const pelvisYaw = -lerp(lerp(0.13, 0.20, r), 0.26, q) * cyc * mg * dz * (1 - 0.4 * wHold) - 0.16 * wHold + 0.8 * lyaw;
+  const pelvisRoll = 0.05 * syc * mg - (0.05 + 0.04 * r) * udx * m - 0.6 * S.leanX;
+  const Dh = qE(pelvisPitch, pelvisYaw, pelvisRoll);
+  // airborne legs: hang from the hips, knees tuck at the apex, reach for the ground on the way down
+  for (const f of feet) {
+    if (air <= 0) continue;
+    const s = f.side, tk = S.jTuck;
+    const ap = V(s * stX, hp.y - R.legLen * (0.95 - (s > 0 ? 0.30 : 0.20) * tk), hp.z - 0.04 + (s > 0 ? 0.16 : -0.10) * tk - 0.10 * S.jRise + 0.05 * S.jFall);
+    f.pos.lerp(ap, air); f.pitch = lerp(f.pitch, 0.6 - 0.5 * S.jFall, air);
+  }
+  // keep both legs within reach: lower the pelvis if a foot target is too far
+  let drop = 0;
+  for (const f of feet) {
+    const hj = (f.side > 0 ? R.hipL : R.hipR).clone().applyQuaternion(Dh).add(hp);
+    const dxz = Math.hypot(f.pos.x - hj.x, f.pos.z - hj.z), maxV = Math.sqrt(Math.max(0.01, (R.legLen * 0.992) ** 2 - dxz * dxz));
+    drop = Math.max(drop, (hj.y - f.pos.y) - maxV);
+  }
+  hp.y -= drop;
+  B.hips.position.copy(B.hips.parent.worldToLocal(toWorld(hp)));
+  fk(B.hips, Dh);
+
+  // --- spine: counter-rotation against the pelvis, lean, breathing, rifle stance twist, torso leading the turn, recoil ---
+  const spYaw = lerp(lerp(0.30, 0.42, r), 0.5, q) * cyc * mg * dz * (1 - 0.6 * wHold * (1 - spr)) * (1 - 0.7 * a) - 0.50 * wHold + 0.8 * yawOff - 0.02 * rec - 0.8 * lyaw;
+  const spPitch = (0.05 * m + 0.14 * r + 0.12 * q) * udz + 0.30 * c + 0.012 * breath + 0.05 * wHold + 0.17 * a * (1 - 0.5 * c)
+    + 0.5 * S.jSquat - 0.10 * S.jRise + 0.08 * S.jFall - 0.35 * lookP - 0.03 * rec + 0.6 * S.leanZ;
+  const spRoll = -pelvisRoll * 1.3 - 0.4 * S.leanX + 0.07 * a;
+  [[B.sp1, 0.25], [B.sp2, 0.35], [B.sp3, 0.40]].forEach(([b, k]) => fk(b, qE(spPitch * k, spYaw * k, spRoll * k)));
+  // shoulders: breathe, shrug up on a jump, and hunch into the stock when aiming
+  fk(B.shL, qE(0, 0.10 * a, 0.02 * breath2 + 0.10 * Math.max(0, S.jArm) + 0.07 * a));
+  fk(B.shR, qE(0, -0.06 * a, -0.02 * breath2 - 0.10 * Math.max(0, S.jArm) - 0.20 * a));
+
+  // --- head: stabilised in actor space (eyes on the target); when aiming it drops and tilts onto the stock ---
+  const chestQ = actor.quaternion.clone().invert().multiply(B.sp3.getWorldQuaternion(Q())).multiply(rest.get(B.sp3).wq.clone().invert());
+  const look = qE(0.02 * breath2 + 0.20 * a - 0.03 * c - 0.65 * lookP - 0.02 * rec, yawOff + 0.05 * Math.sin(t * 0.37) * (1 - m) * (1 - wHold) - 0.10 * a, 0.24 * a);
+  setActorQuat(B.neck, chestQ.clone().slerp(look, lerp(0.5, 0.35, a)).multiply(rest.get(B.neck).wq));
+  setActorQuat(B.head, chestQ.clone().slerp(look, 0.9).multiply(rest.get(B.head).wq));
+
+  // --- legs ---
+  for (const f of feet) {
+    const s = f.side, leg = s > 0 ? [B.legL, B.shinL, B.footL] : [B.legR, B.shinR, B.footR];
+    ik(leg[0], leg[1], leg[2], toWorld(f.pos), dirToWorld(V(s * kneeOut, 0, 1).applyAxisAngle(YAX, lyaw)));
+    setActorQuat(leg[2], qE(f.pitch, f.yaw, 0).multiply(rest.get(leg[2]).wq));
+  }
+
+  // --- weapon: slung on the back → shouldered at the hip (tracks the look) → sights up to the eye; lowered across the body to sprint ---
+  const chestNow = actor.matrixWorld.clone().invert().multiply(B.sp3.matrixWorld);
+  { const p = V(), qq = Q(), s = V(); chestNow.decompose(p, qq, s); chestNow.compose(p, qq, V(1, 1, 1)); }
+  const chestDelta = chestNow.multiply(R.chestRestInv), chestDQ = Q().setFromRotationMatrix(chestDelta);
+  const stowZ = V(0.32, -0.95, 0).normalize(), stowY = V(0, 0, -1);
+  const stowQ = chestDQ.clone().multiply(Q().setFromRotationMatrix(new THREE.Matrix4().makeBasis(stowY.clone().cross(stowZ), stowY, stowZ)));
+  const stowP = V(-0.02, 1.27, -0.165).applyMatrix4(chestDelta);
+  const bobP = 0.012 * Math.sin(2 * TAU * ph) * mg, bobY = 0.010 * Math.sin(TAU * ph) * mg;
+  const kick = -0.05 * rec - 0.03 * S.climb;                 // muzzle rise
+  const hipQ = qE(lerp(0.10, 0.03, fp) - lookP + bobP + 0.6 * S.jSquat + 0.10 * S.jFall + S.swP + kick, yawOff + S.swY + bobY + 0.012 * S.recYaw * rec, -0.10 * (1 - fp) + 0.04 * S.recYaw * rec - 1.5 * S.swY);
+  const aimQ = qE(-lookP + 0.004 * breath + 0.25 * bobP + 0.3 * S.swP + kick, yawOff + 0.3 * S.swY + 0.004 * breath2 + 0.25 * bobY + 0.012 * S.recYaw * rec, 0.04 * S.recYaw * rec);
+  const sprintQ = chestDQ.clone().multiply(qE(0.50 + 0.06 * Math.sin(2 * TAU * ph), 1.0, -0.40));
+  const holdQ = hipQ.slerp(aimQ, a).slerp(sprintQ, spr);
+  const buttY = lerp(lerp(lerp(1.385, 1.51, fp), 1.455, a), 1.30, spr);
+  const buttP = V(lerp(-0.13, -0.10, spr), buttY, lerp(0.085, 0.07, a)).applyMatrix4(chestDelta);
+  const holdP = buttP.sub(W_BUTT.clone().applyQuaternion(holdQ)).add(V(0, 0, -0.03 * rec).applyQuaternion(holdQ));
+  const wq = stowQ.slerp(holdQ, sstep(0.1, 0.85, w));
+  const wp = stowP.lerp(holdP, sstep(0.1, 0.9, w)).add(V(-0.30, -0.05, 0.02).multiplyScalar(Math.sin(Math.PI * clamp01(w)) ** 1.5).applyQuaternion(chestDQ));
+  wM = new THREE.Matrix4().compose(wp, wq, V(1, 1, 1)).premultiply(actor.matrixWorld);
+  weapon.matrix.copy(wM); weapon.matrixWorldNeedsUpdate = true;
+  // the part that cycles with each shot: the pistol slide snaps back, the shotgun fore-end is racked by the left hand
+  let racked = 0;
+  if (WPN.mover) {
+    if (WPN.def.move === 'pump') { const u = clamp01((S.shotT - 0.16) / 0.42); racked = -0.085 * Math.sin(Math.PI * u) ** 2; WPN.mover.position.z = racked; }
+    else WPN.mover.position.z = -0.03 * clamp01(1 - S.shotT / 0.09);
+  }
+  const wWorldQ = Q().setFromRotationMatrix(wM);
+  const wPoint = (v) => v.clone().applyMatrix4(wM);
+
+  // --- arms ---
+  const kR = sstep(0.12, 0.5, w), kL = sstep(0.55, 0.95, w);
+  for (const s of [1, -1]) {
+    const [arm, fore, hand] = s > 0 ? [B.armL, B.foreL, B.handL] : [B.armR, B.foreR, B.handR];
+    const k = s > 0 ? kL : kR;
+    // free arm: a pendulum swinging against the opposite leg (bent and pumping when running, thrown up for a jump)
+    let ang = -s * lerp(lerp(0.52, 1.0, r), 1.3, q) * cyc * mg * dz; if (ang < 0) ang *= 0.75;
+    ang += 0.05 + 0.22 * c + 0.28 * r * m + 0.03 * breath * (1 - m) + 1.0 * S.jArm;
+    const fwd = Math.max(0, Math.sin(ang));
+    const sh = actor.worldToLocal(arm.getWorldPosition(V()));
+    const reach = R.armLen * (0.95 - 0.10 * fwd * (0.5 + m) - 0.17 * c - 0.20 * r - 0.04 * q - 0.14 * Math.abs(S.jArm));
+    const natural = sh.clone().add(V(s * (0.085 + 0.05 * c + 0.10 * air - 0.16 * r * fwd), -Math.cos(ang), Math.sin(ang)).normalize().multiplyScalar(reach));
+    let target = toWorld(natural), pole = dirToWorld(V(s * 0.35, 0.15, -1));
+    let gripQ = null;
+    if (k > 0) {
+      gripQ = wWorldQ.clone().multiply(s > 0 ? GRIP_Q_L : GRIP_Q_R);
+      const grip = s > 0 ? W_GRIP_L.clone().setZ(W_GRIP_L.z + racked) : W_GRIP_R;
+      const wrist = wPoint(grip).sub((s > 0 ? PALM_L : PALM_R).clone().applyQuaternion(gripQ));
+      target.lerp(wrist, k);
+      // elbows: tucked down in the hip hold, the firing elbow lifts out a little when aiming
+      pole.lerp(dirToWorld(s > 0 ? V(0.55, -1, -0.15) : V(-0.75 - 0.35 * a, -1 + 0.35 * a, -0.35)), k).normalize();
+    }
+    ik(arm, fore, hand, target, pole);
+    if (gripQ) setWorldQuat(hand, hand.getWorldQuaternion(Q()).slerp(gripQ, k));
+    // fingers: relaxed curl (a loose fist when running), closing around the weapon; the index finger works the trigger
+    const F = B.fingers[s > 0 ? 'L' : 'R'];
+    F.forEach((f, i) => {
+      const relaxed = [0.18, 0.25, 0.15].map((x) => x * (1 + 0.25 * i) + 0.7 * r);
+      const tr = 0.35 * S.trigger;
+      const grip = s > 0 ? [0.75, 0.95, 0.55] : (i === 0 ? [0.25 + tr, 0.45 + tr, 0.25 + tr] : [0.95, 1.15, 0.7]);
+      f.forEach((b, j) => b.quaternion.multiply(Q().setFromAxisAngle(V(1, 0, 0), -lerp(relaxed[j], grip[j], k))));
+    });
+  }
+}
+
+// ---------- shooting ----------
+function shoot() {
+  const wd = WPN.def;
+  S.rec = Math.min(1.8, S.rec + wd.rec); S.recYaw = Math.random() * 2 - 1; S.climb = Math.min(1, S.climb + wd.climb); S.flash = 0.045; S.shots++;
+  S.shotT = 0; S.fireFresh = false;
+  flash.rotation.z = Math.random() * TAU; flash.scale.setScalar(0.8 + Math.random() * 0.6);
+  const wQ = Q().setFromRotationMatrix(wM), fwd = V(0, 0, 1).applyQuaternion(wQ);
+  const sh = shells[shellI++ % shells.length];
+  sh.m.position.copy(W_PORT.clone().applyMatrix4(wM)); sh.m.quaternion.copy(wQ); sh.m.visible = true; sh.life = 2.5;
+  sh.v.copy(V(-1.6 - Math.random() * 0.8, 1.5 + Math.random() * 0.7, -0.5 + Math.random() * 0.5).applyQuaternion(wQ));
+  sh.w.set(Math.random() * 30 - 15, Math.random() * 30 - 15, Math.random() * 30 - 15);
+  const tr = tracers[tracerI++ % tracers.length];
+  tr.m.position.copy(W_MUZZLE.clone().applyMatrix4(wM)).addScaledVector(fwd, 1.2); tr.m.quaternion.copy(wQ); tr.m.visible = true; tr.life = 0.22;
+  tr.v.copy(fwd).multiplyScalar(140);
+  const mz = tr.m.position;                              // the tracer dies where the shot meets the map
+  tr.life = clamp(world.ray(mz.x, mz.y, mz.z, fwd.x, fwd.y, fwd.z, 31) / 140, 0.015, 0.22);
+}
+function updateProps(dt) {
+  for (const s of shells) {
+    if (s.life <= 0) continue; s.life -= dt; if (s.life <= 0) { s.m.visible = false; continue; }
+    s.v.y -= 9.81 * dt; s.m.position.addScaledVector(s.v, dt);
+    s.m.rotation.x += s.w.x * dt; s.m.rotation.y += s.w.y * dt; s.m.rotation.z += s.w.z * dt;
+    const fl = S.ground + 0.006;
+    if (s.m.position.y < fl) { s.m.position.y = fl; s.v.y *= -0.35; s.v.x *= 0.5; s.v.z *= 0.5; s.w.multiplyScalar(0.4); if (Math.abs(s.v.y) < 0.3) { s.v.set(0, 0, 0); s.w.set(0, 0, 0); } }
+  }
+  for (const tr of tracers) { if (tr.life <= 0) continue; tr.life -= dt; if (tr.life <= 0) { tr.m.visible = false; continue; } tr.m.position.addScaledVector(tr.v, dt); }
+}
+
+// ---------- input (FPS layout) ----------
+const btn = (id) => document.getElementById(id);
+const toggles = {
+  cam: () => setCam(CAMS[(CAMS.indexOf(S.cam) + 1) % CAMS.length]),
+  auto: () => { S.auto = !S.auto; }, walk: () => { S.walkLock = !S.walkLock; if (S.walkLock) S.runLock = false; },
+  run: () => { S.runLock = !S.runLock; if (S.runLock) { S.crouchLock = false; S.walkLock = false; } },
+  crouch: () => { S.crouchLock = !S.crouchLock; if (S.crouchLock) S.runLock = false; },
+  jump: () => { S.jReq = true; },
+  weapon: () => { S.weaponT = S.weaponT ? 0 : 1; if (!S.weaponT) { S.aimLock = false; S.fireLock = false; } },
+  aim: () => { if (!S.weaponT) S.weaponT = 1; S.aimLock = !S.aimLock; },
+  fire: () => { S.fireLock = !S.fireLock; },
+  slow: () => { S.slow = !S.slow; }, skel: () => { if (!skelHelper) return; skelOn = !skelOn; if (skelOn) scene.add(skelHelper); else scene.remove(skelHelper); },
+  full: () => {
+    if (document.fullscreenElement) { document.exitFullscreen(); return; }
+    const p = document.documentElement.requestFullscreen && document.documentElement.requestFullscreen();
+    // in fullscreen the browser lets the page keep Ctrl+W & co. for itself
+    if (p && p.then) p.then(() => { try { navigator.keyboard && navigator.keyboard.lock && navigator.keyboard.lock(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyC', 'KeyF', 'KeyQ', 'KeyX', 'KeyV']).catch(() => {}); } catch (e) {} }).catch(() => {});
+  },
+};
+for (const [id, fn] of [['bCam', 'cam'], ['bAuto', 'auto'], ['bWalk', 'walk'], ['bRun', 'run'], ['bCrouch', 'crouch'], ['bJump', 'jump'], ['bWeapon', 'weapon'], ['bAim', 'aim'], ['bFire', 'fire'], ['bSlow', 'slow'], ['bSkel', 'skel'], ['bFull', 'full']])
+  btn(id).onclick = (e) => { toggles[fn](); e.currentTarget.blur(); };
+btn('bOutfit').onclick = (e) => { nextSkin(); e.currentTarget.blur(); };
+btn('bHead').onclick = (e) => { nextHead(); e.currentTarget.blur(); };
+btn('bCreator').onclick = (e) => { open('kreator-glowy.html', 'kreator-glowy'); e.currentTarget.blur(); };
+const MOVE_KEYS = ['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'];
+const GAME_KEYS = [...MOVE_KEYS, 'c', 'f', 'q', 'x', 'v', 'space', 'control', 'shift'];
+addEventListener('keydown', (e) => {
+  const k = e.key === ' ' ? 'space' : e.key.toLowerCase();
+  if (GAME_KEYS.includes(k) && (e.ctrlKey || k === 'space' || k.startsWith('arrow'))) e.preventDefault();   // Ctrl+S / Ctrl+D etc. must not reach the browser
+  if (e.repeat) return; keys.add(k);
+  if (k === 'c') toggles.crouch(); if (k === 'f') toggles.weapon(); if (k === 'q') toggles.aim(); if (k === 'v') toggles.cam();
+  if (k === 'x') toggles.walk(); if (k === 'space') toggles.jump(); if (k === 'r' && world) spawn(spawnI + 1);
+  if (k.length === 1 && k >= '1' && k <= '6' && arsenal) { const id = WEAPON_ORDER[+k - 1]; if (WPN.id !== id) S.swapTo = id; else if (!S.weaponT) S.weaponT = 1; }
+  if (k === 'k') nextSkin(); if (k === 'l') prevSkin(); if (k === 'j') nextHead();
+  if (MOVE_KEYS.includes(k)) S.auto = false;
+});
+addEventListener('keyup', (e) => keys.delete(e.key === ' ' ? 'space' : e.key.toLowerCase()));
+addEventListener('blur', () => { keys.clear(); S.fireHeld = false; S.aimHeld = false; });
+addEventListener('beforeunload', (e) => { if (keys.has('control')) { e.preventDefault(); e.returnValue = ''; } });   // Ctrl+W while crouch-walking: ask before closing
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+const locked = () => document.pointerLockElement === canvas;
+canvas.addEventListener('mousedown', (e) => {
+  e.preventDefault();
+  if (!locked()) { try { const p = canvas.requestPointerLock(); if (p && p.catch) p.catch(() => {}); } catch (err) {} }
+  if (e.button === 0) S.fireHeld = true;
+  if (e.button === 2) { S.aimHeld = true; S.aimLock = false; }
+});
+addEventListener('mouseup', (e) => { if (e.button === 0) S.fireHeld = false; if (e.button === 2) S.aimHeld = false; });
+addEventListener('mousemove', (e) => {
+  if (S.auto || !(locked() || e.buttons)) return;
+  const sens = 0.0024 * (1 - 0.35 * S.aim);
+  S.lookYaw -= e.movementX * sens; S.lookPitch = clamp(S.lookPitch - e.movementY * sens, -1.15, 1.05);
+});
+canvas.addEventListener('wheel', (e) => { e.preventDefault(); S.camDist = clamp(S.camDist * (e.deltaY > 0 ? 1.1 : 0.9), 1.4, 9); }, { passive: false });
+function setCam(mode) {
+  S.cam = mode; if (headMesh) headMesh.visible = mode !== 'fpp';
+  document.getElementById('cross').style.display = mode === 'front' ? 'none' : 'block';
+  btn('bCam').textContent = 'Kamera: ' + CAM_LABEL[mode] + ' (V)';
+}
+
+// ---------- simulation ----------
+function simulate(dt) {
+  S.time += dt;
+  const air = S.jState === 'air';
+  // --- desired velocity in the look frame ---
+  let ix = 0, iz = 0;
+  if (keys.has('w') || keys.has('arrowup')) iz += 1; if (keys.has('s') || keys.has('arrowdown')) iz -= 1;
+  if (keys.has('a') || keys.has('arrowleft')) ix += 1; if (keys.has('d') || keys.has('arrowright')) ix -= 1;
+  if (S.auto) { ix = 0; iz = 1; }
+  const crouching = S.crouchLock || keys.has('control');
+  const firing = S.fireHeld || S.fireLock;
+  const adsWant = (S.aimHeld || S.aimLock) && !!S.weaponT;
+  const sprintWant = (keys.has('shift') || S.runLock) && !crouching && !adsWant && !firing && iz > 0.5;
+  const base = crouching ? CROUCH : ((adsWant || S.walkLock) ? WALK : (sprintWant ? SPRINT : JOG));
+  let tvx = 0, tvz = 0; const moving = !!(ix || iz);
+  if (moving) {
+    const n = Math.hypot(ix, iz); ix /= n; iz /= n;
+    const f = iz > 0 ? lerp(0.85, 1, iz * iz) : lerp(0.85, 0.75, iz * iz);       // strafing and backpedalling are slower
+    tvx = ix * base * f; tvz = iz * base * f;
+  }
+  const pvx = S.vx, pvz = S.vz, acc = air ? 0.8 : (moving ? 9 : 11);
+  S.vx = damp(S.vx, tvx, acc, dt); S.vz = damp(S.vz, tvz, acc, dt);
+  if (!moving && Math.hypot(S.vx, S.vz) < 0.01) { S.vx = 0; S.vz = 0; }
+  const sp = Math.hypot(S.vx, S.vz);
+  // the body leans into its acceleration (forward on take-off, back when braking, sideways into a strafe)
+  S.legYaw = damp(S.legYaw, sp > 0.3 ? 0.68 * Math.sin(2 * Math.atan2(S.vx, S.vz)) * clamp01(sp / 1.5) : 0, 8, dt);
+  S.leanZ = damp(S.leanZ, air ? 0 : clamp((S.vz - pvz) / dt * 0.012, -0.14, 0.14), 7, dt);
+  S.leanX = damp(S.leanX, air ? 0 : clamp((S.vx - pvx) / dt * 0.010, -0.10, 0.10), 7, dt);
+
+  // --- look & facing: the view turns instantly, the torso follows it, the legs catch up ---
+  if (S.auto) { S.lookYaw += dt * base / 3.6; S.lookPitch = damp(S.lookPitch, 0, 4, dt); }
+  const yawRate = wrap(S.lookYaw - S.pYaw) / dt, pitchRate = (S.lookPitch - S.pPitch) / dt; S.pYaw = S.lookYaw; S.pPitch = S.lookPitch;
+  S.swY = damp(S.swY, clamp(-yawRate * 0.02, -0.07, 0.07), 10, dt);            // the weapon lags a touch behind the view
+  S.swP = damp(S.swP, clamp(pitchRate * 0.02, -0.06, 0.06), 10, dt);
+  const dy = wrap(S.lookYaw - actor.rotation.y); let stepY = dy * (1 - Math.exp(-dt * 12));
+  if (Math.abs(dy - stepY) > 0.9) stepY = dy - Math.sign(dy) * 0.9;
+  actor.rotation.y += stepY; S.yawOff = dy - stepY;
+  S.turnRate = damp(S.turnRate, Math.abs(stepY) / dt, 10, dt);
+  S.turnAmt = clamp01(S.turnRate / 2.0) * (1 - clamp01(sp / 0.8));              // turning on the spot: the feet step around
+
+  // --- stance blends ---
+  S.crouchT = crouching ? 1 : 0;
+  S.crouch = approach(S.crouch, S.crouchT, 5, dt);
+  S.weapon = approach(S.weapon, S.weaponT, 2.6, dt);
+  S.aim = approach(S.aim, adsWant ? 1 : 0, 7, dt);
+  S.sprintK = damp(S.sprintK, (sprintWant && sp > 4.0) ? 1 : 0, 9, dt);
+
+  // --- jump: anticipation squat → ballistic flight → landing absorb ---
+  if (S.jReq) { S.jReq = false; if (S.jState === 'none' || (S.jState === 'land' && S.jT > 0.1)) { S.jState = 'prep'; S.jT = 0; S.crouchLock = false; } }
+  // --- move, then collide with the map: walls push the body out, floors / stairs / ramps set the height of the feet ---
+  const ap = actor.position, bodyH = HEIGHT - 0.5 * S.crouch;
+  ap.x += (Math.sin(S.lookYaw) * S.vz + Math.cos(S.lookYaw) * S.vx) * dt;
+  ap.z += (Math.cos(S.lookYaw) * S.vz - Math.sin(S.lookYaw) * S.vx) * dt;
+  world.moveXZ(ap, S.py, bodyH);
+  const gY = world.groundAt(ap.x, ap.z, S.py);          // highest surface the feet can step onto from where they are
+  if (S.jState !== 'air') {
+    if (S.py - gY > 0.35) { S.jState = 'air'; S.jT = 0; S.pvy = 0; }                  // walked off an edge
+    else S.py = gY > S.py ? Math.min(gY, S.py + 7 * dt) : Math.max(gY, S.py - 7 * dt); // steps are taken smoothly, not snapped
+  }
+  let squatT = 0, armT = 0;
+  if (S.jState === 'prep') {
+    S.jT += dt; squatT = 0.18 * sstep(0, 1, S.jT / 0.07); armT = -0.7 * sstep(0, 1, S.jT / 0.07);
+    if (S.jT >= 0.07) { S.jState = 'air'; S.jT = 0; S.pvy = JUMP_V; S.py += 0.001; }
+  } else if (S.jState === 'air') {
+    S.jT += dt; S.pvy -= GRAV * dt; let ny = S.py + S.pvy * dt;
+    if (S.pvy > 0) { const cl = world.ceilAt(ap.x, ap.z, S.py, bodyH); if (ny + bodyH > cl) { ny = Math.max(S.py, cl - bodyH); S.pvy = 0; } }
+    armT = lerp(1.0, 0.15, clamp01((JUMP_V - S.pvy) / (2 * JUMP_V)));
+    if (ny <= gY && S.pvy <= 0) { ny = gY; S.jState = 'land'; S.jT = 0; }   // gY was taken from the height before this step: no tunnelling
+    S.py = ny;
+  } else if (S.jState === 'land') {
+    S.jT += dt; const u = S.jT / 0.34;
+    squatT = 0.24 * (u < 0.22 ? sstep(0, 0.22, u) : 1 - sstep(0.22, 1, u)); armT = 0.15 * (1 - sstep(0, 0.5, u));
+    if (u >= 1) S.jState = 'none';
+  }
+  const inAir = S.jState === 'air';
+  S.jAir = approach(S.jAir, inAir ? 1 : 0, inAir ? 10 : 16, dt);
+  S.jSquat = damp(S.jSquat, squatT, 32, dt); S.jArm = damp(S.jArm, armT, 14, dt);
+  const vn = inAir ? S.pvy / JUMP_V : 0;
+  S.jTuck = damp(S.jTuck, inAir ? clamp01(1 - vn * vn) : 0, 16, dt);
+  S.jRise = damp(S.jRise, Math.max(0, vn), 16, dt); S.jFall = damp(S.jFall, Math.max(0, -vn), 16, dt);
+  actor.position.y = S.py;
+  S.ground = inAir ? world.groundAt(ap.x, ap.z, S.py) : S.py;
+  S.base = inAir ? Math.min(S.base, S.py) : damp(S.base, S.py, 14, dt);
+
+  // --- locomotion ---
+  if (!inAir) {
+    if (sp > 0.05) S.phase = (S.phase + dt / gaitParams(sp, sstep(0, 1, S.crouch), Math.cos(Math.atan2(S.vx, S.vz) - S.legYaw)).T) % 1;
+    else S.phase = (S.phase + dt * S.turnAmt / 0.55) % 1;
+  }
+
+  // --- firing (from the hip or down the sights; sprinting lowers the rifle) ---
+  if (firing && !S.weaponT) S.weaponT = 1;
+  S.fireHold = firing ? 0.3 : Math.max(0, S.fireHold - dt);
+  S.fireCd -= dt;
+  S.shotT += dt;
+  if (S.swapTo) {                                            // changing weapon: the old one goes down, the new one comes up
+    S.weaponT = 0;
+    if (S.weapon < 0.3) { setWeapon(S.swapTo); S.swapTo = null; S.weaponT = 1; }
+  }
+  if (!firing) S.fireFresh = true;
+  const canFire = firing && S.weapon > 0.98 && S.sprintK < 0.25 && !S.swapTo;
+  S.trigger = damp(S.trigger, canFire && (WPN.def.auto || S.shotT < 0.12) ? 1 : 0, 30, dt);
+  if (canFire && S.fireCd <= 0 && (WPN.def.auto || S.fireFresh || S.fireLock)) { shoot(); S.fireCd = WPN.def.cd; }
+  S.rec *= Math.exp(-dt * 16); S.climb = damp(S.climb, 0, 3, dt);
+  S.flash -= dt; flash.visible = S.flash > 0;
+  updateProps(dt);
+}
+
+// third-person cameras are pulled in along the line from the character (ox, oy, oz) so they never end up behind a wall
+function camClip(ox, oy, oz) {
+  const cp = camera.position, dx = cp.x - ox, dy = cp.y - oy, dz = cp.z - oz, len = Math.hypot(dx, dy, dz);
+  if (len < 1e-4) return;
+  const t = world.ray(ox, oy, oz, dx / len, dy / len, dz / len, len + 0.25);
+  if (t < len + 0.25) { const k = Math.max(0.2, t - 0.25) / len; cp.set(ox + dx * k, oy + dy * k, oz + dz * k); }
+}
+// ---------- cameras: first person, over the shoulder, and facing the character ----------
+function updateCamera(dt) {
+  const yaw = S.lookYaw, a = sstep(0, 1, S.aim) * sstep(0.85, 1, S.weapon), c = S.crouch, p = actor.position;
+  const kickP = (0.035 * S.rec + 0.03 * S.climb) * lerp(0.6, 1, a), kickY = 0.008 * S.recYaw * S.rec;
+  let fov;
+  if (S.cam === 'fpp') {
+    // eyes ride on the head bone; when aiming the camera settles onto the sights
+    const eye = B.head.getWorldPosition(V()).add(V(0, 0.105, 0.09).applyAxisAngle(V(0, 1, 0), yaw));
+    eye.lerp(W_SIGHT_EYE.clone().applyMatrix4(wM), a);
+    camera.position.copy(eye);
+    camera.quaternion.setFromEuler(new THREE.Euler(S.lookPitch + kickP, yaw + Math.PI + kickY, 0, 'YXZ'));
+    fov = lerp(74, 56, a) + 7 * S.sprintK;
+  } else if (S.cam === 'tpp') {
+    const pit = clamp(S.lookPitch, -1.0, 0.9), cp = Math.cos(pit);
+    const fwd = V(Math.sin(yaw) * cp, Math.sin(pit), Math.cos(yaw) * cp), right = V(-Math.cos(yaw), 0, Math.sin(yaw));
+    const pivot = V(p.x, 1.5 - 0.3 * c + S.base + 0.6 * (S.py - S.base), p.z).addScaledVector(right, lerp(0.45, 0.38, a));
+    camera.position.copy(pivot).addScaledVector(fwd, -S.camDist * lerp(1, 0.6, a)); camera.position.y = Math.max(0.12, camera.position.y);
+    camClip(p.x, pivot.y, p.z);
+    camera.quaternion.setFromEuler(new THREE.Euler(pit + 0.5 * kickP, yaw + Math.PI + 0.5 * kickY, 0, 'YXZ'));
+    fov = lerp(58, 46, a) + 5 * S.sprintK;
+  } else {
+    const tgt = V(p.x, 1.12 - 0.25 * c + S.base + 0.6 * (S.py - S.base), p.z);
+    camera.position.set(p.x + Math.sin(yaw) * S.camDist, tgt.y + 0.3, p.z + Math.cos(yaw) * S.camDist);
+    camClip(tgt.x, tgt.y, tgt.z);
+    camera.lookAt(tgt); fov = 44;
+  }
+  S.fov = damp(S.fov, fov, 12, dt);
+  if (Math.abs(camera.fov - S.fov) > 0.01) { camera.fov = S.fov; camera.updateProjectionMatrix(); }
+}
+
+const stateEl = document.getElementById('state'), hudOn = {}; let hudHtml = '', hudN = 0;
+function hud() {
+  const on = (id, v) => { v = !!v; if (hudOn[id] !== v) { hudOn[id] = v; btn(id).classList.toggle('on', v); } };
+  on('bAuto', S.auto); on('bWalk', S.walkLock); on('bRun', S.runLock || keys.has('shift')); on('bCrouch', S.crouchT); on('bJump', S.jState !== 'none');
+  on('bWeapon', S.weaponT); on('bAim', S.aimLock || S.aimHeld); on('bFire', S.fireLock || S.fireHeld); on('bSlow', S.slow);
+  on('bSkel', skelOn); on('bFull', document.fullscreenElement);
+  const sp = Math.hypot(S.vx, S.vz); let mv;
+  if (S.jState === 'air' || S.jState === 'prep') mv = 'skok';
+  else if (sp < 0.12) mv = S.crouchT ? 'kuca' : 'stoi';
+  else {
+    const dir = Math.abs(S.dirZ) > 0.8 ? (S.dirZ > 0 ? '' : ' do tyłu') : (Math.abs(S.dirX) > 0.8 ? (S.dirX > 0 ? ' w lewo' : ' w prawo') : ' po skosie');
+    mv = (S.crouchT ? 'chód w kucki' : (sp > 4.4 ? 'sprint' : (sp > 2.2 ? 'bieg' : 'chód'))) + dir;
+  }
+  const hd = currentHead();
+  const parts = [mv, WPN.def.name, 'strój: ' + OUTFITS[skinI].name, 'głowa: ' + (hd ? hd.name : 'płótno')];
+  if (S.weaponT) parts.push(S.fireHold > 0 && S.weapon > 0.98 ? 'strzela' : (S.aim > 0.5 ? 'celuje' : 'broń przy ramieniu')); else parts.push('broń na plecach');
+  const html = 'Stan: <b>' + parts.join(' + ') + '</b> &nbsp; ' + sp.toFixed(1) + ' m/s' + (locked() ? '' : ' &nbsp; <b>— kliknij w obraz, żeby sterować myszą</b>');
+  if (html !== hudHtml) { hudHtml = html; stateEl.innerHTML = html; }
+}
+
+const clock = new THREE.Clock();
+function frame() {
+  requestAnimationFrame(frame);
+  const raw = clock.getDelta(); let dt = Math.min(raw, 0.05);
+  adaptRes(raw);
+  if (S.slow) dt *= 0.25;
+  tick(dt);
+}
+// Dynamic resolution: below ~48 fps the render scale steps down (to 60% at most); it creeps back up when there is headroom,
+// but will not retry a scale that just proved too heavy for 30 s. Smoothness first, sharpness second.
+let prScale = 1, prAcc = 0, prN = 0, prGood = 0, prCeil = 1, prCeilT = 0;
+function adaptRes(raw) {
+  if (raw > 0.1 || raw <= 0) return;                        // tab switches and hitches are not a trend
+  prAcc += raw; prN++; if (prAcc < 1) return;
+  const avg = prAcc / prN; prAcc = 0; prN = 0; let ns = prScale;
+  if (prCeilT > 0 && --prCeilT === 0) prCeil = 1;
+  if (avg > 1 / 48 && prScale > 0.6) { prCeil = Math.max(0.6, prScale - 0.1); prCeilT = 30; ns = Math.max(0.6, prScale - 0.15); prGood = 0; }
+  else if (avg < 1 / 57 && prScale < prCeil) { if (++prGood >= 3) { prGood = 0; ns = Math.min(prCeil, prScale + 0.1); } }
+  if (ns !== prScale) { prScale = ns; renderer.setPixelRatio(PR_MAX * prScale); }
+}
+function tick(dt) {
+  if (ready && world && WPN) {
+    if (!S.paused) simulate(dt);
+    pose();
+    if (!S.paused) updateCamera(dt);
+    const ap = actor.position;
+    sun.target.position.set(ap.x, S.py + 0.9, ap.z); sun.position.copy(sun.target.position).addScaledVector(SUN_DIR, 10);
+    shadowQuad.position.set(ap.x - SUN_DIR.x * 1.6, S.ground + 0.02, ap.z - SUN_DIR.z * 1.6);
+    if ((hudN++ & 7) === 0) hud();
+  }
+  renderer.render(scene, camera);
+}
+frame();
+
+// debugging hooks (contact sheet of poses: dbg.sheet([{phase:0,vz:3.2}, ...], 'left'))
+const NEUTRAL = { vx: 0, vz: 0, phase: 0.3, crouch: 0, weapon: 0, aim: 0, time: 1, py: 0, jAir: 0, jSquat: 0, jArm: 0, jTuck: 0, jRise: 0, jFall: 0, rec: 0, climb: 0,
+  lookPitch: 0, trigger: 0, sprintK: 0, yawOff: 0, turnAmt: 0, leanX: 0, leanZ: 0, legYaw: 0, swY: 0, swP: 0, cam: 'tpp' };
+window.dbg = { BUILD, tick, setWeapon, applyOutfit, renderer, scene, get prScale() { return prScale; }, get skinData() { return bodySkin; }, rest, S, actor, B, R, camera, toggles, pose, setCam, keys,
+  view(name, dist = 3.4, y = 0.95) { const p = actor.position; const m = { front: [0, 0.08, 1], back: [0, 0.08, -1], left: [1, 0.08, 0], right: [-1, 0.08, 0], q: [0.7, 0.25, 0.8], qr: [-0.7, 0.25, 0.8], qb: [-0.7, 0.3, -0.8], top: [0.01, 1, 0.3] }[name];
+    const v = V(...m).normalize().multiplyScalar(dist).applyAxisAngle(V(0, 1, 0), actor.rotation.y);
+    camera.position.set(p.x + v.x, y + v.y, p.z + v.z); camera.lookAt(p.x, y, p.z); },
+  sheet(cfgs, view = 'left', dist = 3.4, y = 0.95, cropW = 0.5) {
+    S.paused = true; let cv = document.getElementById('sheet');
+    if (!cv) { cv = document.createElement('canvas'); cv.id = 'sheet'; cv.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;z-index:9;background:#111'; document.body.appendChild(cv); }
+    cv.width = innerWidth; cv.height = innerHeight; const ctx = cv.getContext('2d'); ctx.fillStyle = '#111'; ctx.fillRect(0, 0, cv.width, cv.height);
+    camera.fov = 40; camera.updateProjectionMatrix(); if (headMesh) headMesh.visible = true;
+    const src = canvas, sw = src.height * cropW, n = cfgs.length, cw = cv.width / n, ch = Math.min(cv.height, cw / cropW);
+    cfgs.forEach((cfg, i) => { Object.assign(S, NEUTRAL, cfg); actor.position.set(0, S.py, 0); actor.rotation.y = 0; pose();
+      this.view(cfg.view || view, cfg.dist || dist, y); renderer.render(scene, camera);
+      ctx.drawImage(src, (src.width - sw) / 2, 0, sw, src.height, i * cw, 0, cw, ch); });
+    return n; },
+  // podglad strojow: dbg.studio() chowa mape (neutralne tlo); dbg.outfits([0, 1, [7, 'q', 1.0, 1.25]]) - galeria strojow,
+  // kazdy element to numer stroju albo [numer, widok, odleglosc, wysokosc kamery]
+  studio() { for (const o of scene.children) if (o !== actor && o !== weapon && !o.isLight) o.visible = false; scene.background = new THREE.Color(0x8a8f99); scene.fog = null; },
+  outfits(ids, view = 'front', dist = 2.3, y = 0.98, cropW = 0.36) {
+    this.sheet([{ view }], view, dist, y, cropW);
+    const cv = document.getElementById('sheet'), ctx = cv.getContext('2d'), sw = canvas.height * cropW, cw = cv.width / ids.length, ch = Math.min(cv.height, cw / cropW);
+    ctx.fillStyle = '#111'; ctx.fillRect(0, 0, cv.width, cv.height);
+    ids.forEach((id, k) => { const [i, v, d, yy] = Array.isArray(id) ? id : [id, view, dist, y];
+      applyOutfit(i); this.view(v, d, yy); renderer.render(scene, camera); ctx.drawImage(canvas, (canvas.width - sw) / 2, 0, sw, canvas.height, k * cw, 0, cw, ch); });
+    return ids.length; },
+  unsheet(cam = 'fpp') { const cv = document.getElementById('sheet'); if (cv) cv.remove(); Object.assign(S, NEUTRAL, { paused: false, jState: 'none', weapon: 1, weaponT: 1 }); actor.position.y = 0; setCam(cam); } };
+</script>
+</body>
+</html>

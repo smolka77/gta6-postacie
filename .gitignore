@@ -1,0 +1,16 @@
+# Repozytorium zawiera tylko postac, stroje, glowe i kreator - wszystko inne jest pomijane.
+/*
+!/.gitignore
+!/README.md
+!/index.html
+!/character.glb
+!/kreator-glowy.html
+!/server.ps1
+!/start.bat
+!/game/
+/game/*
+!/game/outfits.js
+!/game/head.js
+!/skins/
+/skins/*
+!/skins/heads/
